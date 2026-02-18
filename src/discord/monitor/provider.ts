@@ -1,29 +1,36 @@
-import { Client, type BaseMessageInteractiveComponent } from "@buape/carbon";
-import { GatewayIntents, GatewayPlugin } from "@buape/carbon/gateway";
-import { Routes } from "discord-api-types/v10";
-import { existsSync, readdirSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { inspect } from "node:util";
-import WebSocket, { type ClientOptions as WebSocketClientOptions } from "ws";
-import type { HistoryEntry } from "../../auto-reply/reply/history.js";
-import type { OpenClawConfig, ReplyToMode } from "../../config/config.js";
-import type { RuntimeEnv } from "../../runtime.js";
+import {
+  Client,
+  ReadyListener,
+  type BaseMessageInteractiveComponent,
+  type Modal,
+} from "@buape/carbon";
+import type { GatewayPlugin } from "@buape/carbon/gateway";
+import { Routes } from "discord-api-types/v10";
 import { resolveTextChunkLimit } from "../../auto-reply/chunk.js";
 import { listNativeCommandSpecsForConfig } from "../../auto-reply/commands-registry.js";
+import type { HistoryEntry } from "../../auto-reply/reply/history.js";
 import { listSkillCommandsForAgents } from "../../auto-reply/skill-commands.js";
-import { mergeAllowlist, summarizeMapping } from "../../channels/allowlists/resolve-utils.js";
+import {
+  addAllowlistUserEntriesFromConfigEntry,
+  buildAllowlistResolutionSummary,
+  mergeAllowlist,
+  resolveAllowlistIdAdditions,
+  patchAllowlistUsersInConfigEntries,
+  summarizeMapping,
+} from "../../channels/allowlists/resolve-utils.js";
 import {
   isNativeCommandsExplicitlyDisabled,
   resolveNativeCommandsEnabled,
   resolveNativeSkillsEnabled,
 } from "../../config/commands.js";
+import type { OpenClawConfig, ReplyToMode } from "../../config/config.js";
 import { loadConfig } from "../../config/config.js";
 import { danger, logVerbose, shouldLogVerbose, warn } from "../../globals.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createDiscordRetryRunner } from "../../infra/retry-policy.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { createNonExitingRuntime, type RuntimeEnv } from "../../runtime.js";
 import { resolveDiscordAccount } from "../accounts.js";
 import { attachDiscordGatewayLogging } from "../gateway-logging.js";
 import { getDiscordGatewayEmitter, waitForDiscordGatewayStop } from "../monitor.gateway.js";
@@ -31,8 +38,19 @@ import { fetchDiscordApplicationId, fetchDiscordApplicationSummary } from "../pr
 import { resolveDiscordChannelAllowlist } from "../resolve-channels.js";
 import { resolveDiscordUserAllowlist } from "../resolve-users.js";
 import { normalizeDiscordToken } from "../token.js";
-import { createAgentComponentButton, createAgentSelectMenu } from "./agent-components.js";
+import {
+  createAgentComponentButton,
+  createAgentSelectMenu,
+  createDiscordComponentButton,
+  createDiscordComponentChannelSelect,
+  createDiscordComponentMentionableSelect,
+  createDiscordComponentModal,
+  createDiscordComponentRoleSelect,
+  createDiscordComponentStringSelect,
+  createDiscordComponentUserSelect,
+} from "./agent-components.js";
 import { createExecApprovalButton, DiscordExecApprovalHandler } from "./exec-approvals.js";
+import { createDiscordGatewayPlugin } from "./gateway-plugin.js";
 import { registerGateway, unregisterGateway } from "./gateway-registry.js";
 import {
   DiscordMessageListener,
@@ -46,6 +64,8 @@ import {
   createDiscordCommandArgFallbackButton,
   createDiscordNativeCommand,
 } from "./native-command.js";
+import { resolveDiscordPresenceUpdate } from "./presence.js";
+import { resolveDiscordRestFetch } from "./rest-fetch.js";
 
 export type MonitorDiscordOpts = {
   token?: string;
@@ -58,148 +78,7 @@ export type MonitorDiscordOpts = {
   replyToMode?: ReplyToMode;
 };
 
-type ProxyAgentCtor = new (proxyUrl: string) => NonNullable<WebSocketClientOptions["agent"]>;
-
-let discordProxyAgentCtorCache: ProxyAgentCtor | null | undefined;
-
-function resolveDiscordGatewayProxyUrl(): string | undefined {
-  const candidates = [
-    process.env.HTTPS_PROXY,
-    process.env.https_proxy,
-    process.env.ALL_PROXY,
-    process.env.all_proxy,
-    process.env.HTTP_PROXY,
-    process.env.http_proxy,
-  ];
-  for (const value of candidates) {
-    const normalized = typeof value === "string" ? value.trim() : "";
-    if (normalized) {
-      return normalized;
-    }
-  }
-  return undefined;
-}
-
-function summarizeProxyUrl(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}`;
-  } catch {
-    return "configured";
-  }
-}
-
-function normalizeProxyAgentCtor(mod: unknown): ProxyAgentCtor | null {
-  if (!mod || typeof mod !== "object") {
-    return null;
-  }
-  const candidate = (mod as Record<string, unknown>).ProxyAgent;
-  if (typeof candidate === "function") {
-    return candidate as ProxyAgentCtor;
-  }
-  const fallback = (mod as Record<string, unknown>).default;
-  if (typeof fallback === "function") {
-    return fallback as ProxyAgentCtor;
-  }
-  return null;
-}
-
-function loadProxyAgentCtorFromPnpmStore(): ProxyAgentCtor | null {
-  const requireForCurrentModule = createRequire(import.meta.url);
-  const moduleDir = dirname(fileURLToPath(import.meta.url));
-  let currentDir = moduleDir;
-  for (let depth = 0; depth < 10; depth += 1) {
-    const storeDir = join(currentDir, "node_modules", ".pnpm");
-    if (existsSync(storeDir)) {
-      const proxyAgentEntry = readdirSync(storeDir).find((entry) =>
-        entry.startsWith("proxy-agent@"),
-      );
-      if (proxyAgentEntry) {
-        const proxyAgentPath = join(storeDir, proxyAgentEntry, "node_modules", "proxy-agent");
-        if (existsSync(proxyAgentPath)) {
-          try {
-            const loaded = requireForCurrentModule(proxyAgentPath);
-            return normalizeProxyAgentCtor(loaded);
-          } catch {
-            return null;
-          }
-        }
-      }
-    }
-    const parent = dirname(currentDir);
-    if (parent === currentDir) {
-      break;
-    }
-    currentDir = parent;
-  }
-  return null;
-}
-
-function loadDiscordProxyAgentCtor(): ProxyAgentCtor | null {
-  if (discordProxyAgentCtorCache !== undefined) {
-    return discordProxyAgentCtorCache;
-  }
-  const requireForCurrentModule = createRequire(import.meta.url);
-  try {
-    const loaded = requireForCurrentModule("proxy-agent");
-    const ctor = normalizeProxyAgentCtor(loaded);
-    if (ctor) {
-      discordProxyAgentCtorCache = ctor;
-      return ctor;
-    }
-  } catch {
-    // Fallback below.
-  }
-  const ctorFromStore = loadProxyAgentCtorFromPnpmStore();
-  discordProxyAgentCtorCache = ctorFromStore;
-  return ctorFromStore;
-}
-
-function resolveDiscordGatewayWebSocketOptions(
-  runtime: RuntimeEnv,
-): WebSocketClientOptions | undefined {
-  const proxyUrl = resolveDiscordGatewayProxyUrl();
-  if (!proxyUrl) {
-    return undefined;
-  }
-  const proxyAgentCtor = loadDiscordProxyAgentCtor();
-  if (!proxyAgentCtor) {
-    runtime.log?.(
-      warn(
-        `discord: proxy is configured (${summarizeProxyUrl(proxyUrl)}), but proxy-agent is unavailable; gateway websocket may bypass proxy`,
-      ),
-    );
-    return undefined;
-  }
-  try {
-    const agent = new proxyAgentCtor(proxyUrl);
-    runtime.log?.(`discord: gateway websocket proxy enabled (${summarizeProxyUrl(proxyUrl)})`);
-    return { agent };
-  } catch (err) {
-    runtime.error?.(
-      danger(`discord: failed to create websocket proxy agent: ${formatErrorMessage(err)}`),
-    );
-    return undefined;
-  }
-}
-
-class OpenClawDiscordGatewayPlugin extends GatewayPlugin {
-  constructor(
-    options: ConstructorParameters<typeof GatewayPlugin>[0],
-    private readonly wsOptions?: WebSocketClientOptions,
-  ) {
-    super(options);
-  }
-
-  protected override createWebSocket(url: string): WebSocket {
-    if (this.wsOptions) {
-      return new WebSocket(url, this.wsOptions);
-    }
-    return super.createWebSocket(url);
-  }
-}
-
-function summarizeAllowList(list?: Array<string | number>) {
+function summarizeAllowList(list?: string[]) {
   if (!list || list.length === 0) {
     return "any";
   }
@@ -216,6 +95,26 @@ function summarizeGuilds(entries?: Record<string, unknown>) {
   const sample = keys.slice(0, 4);
   const suffix = keys.length > sample.length ? ` (+${keys.length - sample.length})` : "";
   return `${sample.join(", ")}${suffix}`;
+}
+
+function dedupeSkillCommandsForDiscord(
+  skillCommands: ReturnType<typeof listSkillCommandsForAgents>,
+) {
+  const seen = new Set<string>();
+  const deduped: ReturnType<typeof listSkillCommandsForAgents> = [];
+  for (const command of skillCommands) {
+    const key = command.skillName.trim().toLowerCase();
+    if (!key) {
+      deduped.push(command);
+      continue;
+    }
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(command);
+  }
+  return deduped;
 }
 
 async function deployDiscordCommands(params: {
@@ -268,32 +167,6 @@ function formatDiscordDeployErrorDetails(err: unknown): string {
   return details.length > 0 ? ` (${details.join(", ")})` : "";
 }
 
-function resolveDiscordGatewayIntents(
-  intentsConfig?: import("../../config/types.discord.js").DiscordIntentsConfig,
-  opts?: { messageContentStatus?: "enabled" | "limited" | "disabled" },
-): number {
-  let intents =
-    GatewayIntents.Guilds |
-    GatewayIntents.GuildMessages |
-    GatewayIntents.DirectMessages |
-    GatewayIntents.GuildMessageReactions |
-    GatewayIntents.DirectMessageReactions;
-  const messageContentEnabledByPortal =
-    opts?.messageContentStatus === "enabled" || opts?.messageContentStatus === "limited";
-  const shouldEnableMessageContent =
-    intentsConfig?.messageContent ?? messageContentEnabledByPortal;
-  if (shouldEnableMessageContent) {
-    intents |= GatewayIntents.MessageContent;
-  }
-  if (intentsConfig?.presence) {
-    intents |= GatewayIntents.GuildPresences;
-  }
-  if (intentsConfig?.guildMembers) {
-    intents |= GatewayIntents.GuildMembers;
-  }
-  return intents;
-}
-
 export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   const cfg = opts.config ?? loadConfig();
   const account = resolveDiscordAccount({
@@ -307,15 +180,10 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     );
   }
 
-  const runtime: RuntimeEnv = opts.runtime ?? {
-    log: console.log,
-    error: console.error,
-    exit: (code: number): never => {
-      throw new Error(`exit ${code}`);
-    },
-  };
+  const runtime: RuntimeEnv = opts.runtime ?? createNonExitingRuntime();
 
   const discordCfg = account.config;
+  const discordRestFetch = resolveDiscordRestFetch(discordCfg.proxy, runtime);
   const dmConfig = discordCfg.dm;
   let guildEntries = discordCfg.guilds;
   const defaultGroupPolicy = cfg.channels?.defaults?.groupPolicy;
@@ -332,7 +200,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       ),
     );
   }
-  let allowFrom = dmConfig?.allowFrom;
+  let allowFrom = discordCfg.allowFrom ?? dmConfig?.allowFrom;
   const mediaMaxBytes = (opts.mediaMaxMb ?? discordCfg.mediaMaxMb ?? 8) * 1024 * 1024;
   const textLimit = resolveTextChunkLimit(cfg, "discord", account.accountId, {
     fallbackLimit: 2000,
@@ -343,7 +211,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   );
   const replyToMode = opts.replyToMode ?? discordCfg.replyToMode ?? "off";
   const dmEnabled = dmConfig?.enabled ?? true;
-  const dmPolicy = dmConfig?.policy ?? "pairing";
+  const dmPolicy = discordCfg.dmPolicy ?? dmConfig?.policy ?? "pairing";
   const groupDmEnabled = dmConfig?.groupEnabled ?? false;
   const groupDmChannels = dmConfig?.groupChannels;
   const nativeEnabled = resolveNativeCommandsEnabled({
@@ -375,7 +243,8 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
           const channels = guildCfg?.channels ?? {};
           const channelKeys = Object.keys(channels).filter((key) => key !== "*");
           if (channelKeys.length === 0) {
-            entries.push({ input: guildKey, guildKey });
+            const input = /^\d+$/.test(guildKey) ? `guild:${guildKey}` : guildKey;
+            entries.push({ input, guildKey });
             continue;
           }
           for (const channelKey of channelKeys) {
@@ -390,6 +259,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
           const resolved = await resolveDiscordChannelAllowlist({
             token,
             entries: entries.map((entry) => entry.input),
+            fetcher: discordRestFetch,
           });
           const nextGuilds = { ...guildEntries };
           const mapping: string[] = [];
@@ -446,18 +316,9 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
         const resolvedUsers = await resolveDiscordUserAllowlist({
           token,
           entries: allowEntries.map((entry) => String(entry)),
+          fetcher: discordRestFetch,
         });
-        const mapping: string[] = [];
-        const unresolved: string[] = [];
-        const additions: string[] = [];
-        for (const entry of resolvedUsers) {
-          if (entry.resolved && entry.id) {
-            mapping.push(`${entry.input}→${entry.id}`);
-            additions.push(entry.id);
-          } else {
-            unresolved.push(entry.input);
-          }
-        }
+        const { mapping, unresolved, additions } = buildAllowlistResolutionSummary(resolvedUsers);
         allowFrom = mergeAllowlist({ existing: allowFrom, additions });
         summarizeMapping("discord users", mapping, unresolved, runtime);
       } catch (err) {
@@ -473,30 +334,10 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
         if (!guild || typeof guild !== "object") {
           continue;
         }
-        const users = (guild as { users?: Array<string | number> }).users;
-        if (Array.isArray(users)) {
-          for (const entry of users) {
-            const trimmed = String(entry).trim();
-            if (trimmed && trimmed !== "*") {
-              userEntries.add(trimmed);
-            }
-          }
-        }
+        addAllowlistUserEntriesFromConfigEntry(userEntries, guild);
         const channels = (guild as { channels?: Record<string, unknown> }).channels ?? {};
         for (const channel of Object.values(channels)) {
-          if (!channel || typeof channel !== "object") {
-            continue;
-          }
-          const channelUsers = (channel as { users?: Array<string | number> }).users;
-          if (!Array.isArray(channelUsers)) {
-            continue;
-          }
-          for (const entry of channelUsers) {
-            const trimmed = String(entry).trim();
-            if (trimmed && trimmed !== "*") {
-              userEntries.add(trimmed);
-            }
-          }
+          addAllowlistUserEntriesFromConfigEntry(userEntries, channel);
         }
       }
 
@@ -505,14 +346,10 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
           const resolvedUsers = await resolveDiscordUserAllowlist({
             token,
             entries: Array.from(userEntries),
+            fetcher: discordRestFetch,
           });
-          const resolvedMap = new Map(resolvedUsers.map((entry) => [entry.input, entry]));
-          const mapping = resolvedUsers
-            .filter((entry) => entry.resolved && entry.id)
-            .map((entry) => `${entry.input}→${entry.id}`);
-          const unresolved = resolvedUsers
-            .filter((entry) => !entry.resolved)
-            .map((entry) => entry.input);
+          const { resolvedMap, mapping, unresolved } =
+            buildAllowlistResolutionSummary(resolvedUsers);
 
           const nextGuilds = { ...guildEntries };
           for (const [guildKey, guildConfig] of Object.entries(guildEntries ?? {})) {
@@ -520,43 +357,17 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
               continue;
             }
             const nextGuild = { ...guildConfig } as Record<string, unknown>;
-            const users = (guildConfig as { users?: Array<string | number> }).users;
+            const users = (guildConfig as { users?: string[] }).users;
             if (Array.isArray(users) && users.length > 0) {
-              const additions: string[] = [];
-              for (const entry of users) {
-                const trimmed = String(entry).trim();
-                const resolved = resolvedMap.get(trimmed);
-                if (resolved?.resolved && resolved.id) {
-                  additions.push(resolved.id);
-                }
-              }
+              const additions = resolveAllowlistIdAdditions({ existing: users, resolvedMap });
               nextGuild.users = mergeAllowlist({ existing: users, additions });
             }
             const channels = (guildConfig as { channels?: Record<string, unknown> }).channels ?? {};
             if (channels && typeof channels === "object") {
-              const nextChannels: Record<string, unknown> = { ...channels };
-              for (const [channelKey, channelConfig] of Object.entries(channels)) {
-                if (!channelConfig || typeof channelConfig !== "object") {
-                  continue;
-                }
-                const channelUsers = (channelConfig as { users?: Array<string | number> }).users;
-                if (!Array.isArray(channelUsers) || channelUsers.length === 0) {
-                  continue;
-                }
-                const additions: string[] = [];
-                for (const entry of channelUsers) {
-                  const trimmed = String(entry).trim();
-                  const resolved = resolvedMap.get(trimmed);
-                  if (resolved?.resolved && resolved.id) {
-                    additions.push(resolved.id);
-                  }
-                }
-                nextChannels[channelKey] = {
-                  ...channelConfig,
-                  users: mergeAllowlist({ existing: channelUsers, additions }),
-                };
-              }
-              nextGuild.channels = nextChannels;
+              nextGuild.channels = patchAllowlistUsersInConfigEntries({
+                entries: channels,
+                resolvedMap,
+              });
             }
             nextGuilds[guildKey] = nextGuild;
           }
@@ -577,21 +388,28 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     );
   }
 
-  const applicationSummary = await fetchDiscordApplicationSummary(token, 4000);
-  const applicationId = applicationSummary?.id ?? (await fetchDiscordApplicationId(token, 4000));
+  const applicationSummary = await fetchDiscordApplicationSummary(token, 4000, discordRestFetch);
+  const applicationId =
+    applicationSummary?.id ?? (await fetchDiscordApplicationId(token, 4000, discordRestFetch));
   if (!applicationId) {
     throw new Error("Failed to resolve Discord application id");
   }
   const messageContentStatus = applicationSummary?.intents?.messageContent;
-  if (messageContentStatus === "disabled") {
+  if (
+    messageContentStatus === "disabled" &&
+    discordCfg.intents?.messageContent === undefined
+  ) {
     runtime.log?.(
       warn("discord: Message Content Intent disabled in Portal; running in mention-safe mode."),
     );
+    discordCfg.intents = { ...(discordCfg.intents ?? {}), messageContent: false };
   }
 
   const maxDiscordCommands = 100;
   let skillCommands =
-    nativeEnabled && nativeSkillsEnabled ? listSkillCommandsForAgents({ cfg }) : [];
+    nativeEnabled && nativeSkillsEnabled
+      ? dedupeSkillCommandsForDiscord(listSkillCommandsForAgents({ cfg }))
+      : [];
   let commandSpecs = nativeEnabled
     ? listNativeCommandSpecsForConfig(cfg, { skillCommands, provider: "discord" })
     : [];
@@ -646,33 +464,50 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       sessionPrefix,
     }),
   ];
+  const modals: Modal[] = [];
 
   if (execApprovalsHandler) {
     components.push(createExecApprovalButton({ handler: execApprovalsHandler }));
   }
 
   if (agentComponentsEnabled) {
-    components.push(
-      createAgentComponentButton({
-        cfg,
-        accountId: account.accountId,
-        guildEntries,
-        allowFrom,
-        dmPolicy,
-      }),
-    );
-    components.push(
-      createAgentSelectMenu({
-        cfg,
-        accountId: account.accountId,
-        guildEntries,
-        allowFrom,
-        dmPolicy,
-      }),
-    );
+    const componentContext = {
+      cfg,
+      discordConfig: discordCfg,
+      accountId: account.accountId,
+      guildEntries,
+      allowFrom,
+      dmPolicy,
+      runtime,
+      token,
+    };
+    components.push(createAgentComponentButton(componentContext));
+    components.push(createAgentSelectMenu(componentContext));
+    components.push(createDiscordComponentButton(componentContext));
+    components.push(createDiscordComponentStringSelect(componentContext));
+    components.push(createDiscordComponentUserSelect(componentContext));
+    components.push(createDiscordComponentRoleSelect(componentContext));
+    components.push(createDiscordComponentMentionableSelect(componentContext));
+    components.push(createDiscordComponentChannelSelect(componentContext));
+    modals.push(createDiscordComponentModal(componentContext));
   }
 
-  const gatewayWebSocketOptions = resolveDiscordGatewayWebSocketOptions(runtime);
+  class DiscordStatusReadyListener extends ReadyListener {
+    async handle(_data: unknown, client: Client) {
+      const gateway = client.getPlugin<GatewayPlugin>("gateway");
+      if (!gateway) {
+        return;
+      }
+
+      const presence = resolveDiscordPresenceUpdate(discordCfg);
+      if (!presence) {
+        return;
+      }
+
+      gateway.updatePresence(presence);
+    }
+  }
+
   const client = new Client(
     {
       baseUrl: "http://localhost",
@@ -684,23 +519,11 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     },
     {
       commands,
-      listeners: [],
+      listeners: [new DiscordStatusReadyListener()],
       components,
+      modals,
     },
-    [
-      new OpenClawDiscordGatewayPlugin(
-        {
-        reconnect: {
-          maxAttempts: 50,
-        },
-        intents: resolveDiscordGatewayIntents(discordCfg.intents, {
-          messageContentStatus,
-        }),
-        autoInteractions: true,
-        },
-        gatewayWebSocketOptions,
-      ),
-    ],
+    [createDiscordGatewayPlugin({ discordConfig: discordCfg, runtime })],
   );
 
   await deployDiscordCommands({ client, runtime, enabled: nativeEnabled });
@@ -879,3 +702,9 @@ async function clearDiscordNativeCommands(params: {
     params.runtime.error?.(danger(`discord: failed to clear native commands: ${String(err)}`));
   }
 }
+
+export const __testing = {
+  createDiscordGatewayPlugin,
+  dedupeSkillCommandsForDiscord,
+  resolveDiscordRestFetch,
+};
