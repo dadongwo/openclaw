@@ -57,11 +57,82 @@ export type {
   DiscordMessagePreflightParams,
 } from "./message-handler.preflight.types.js";
 
+function countDiscordAttachments(message: {
+  attachments?: Array<unknown> | null | undefined;
+}): number {
+  return Array.isArray(message.attachments) ? message.attachments.length : 0;
+}
+
+function hasExplicitBotMention(
+  message: {
+    mentionedUsers?: Array<{ id?: string | null }> | null | undefined;
+  },
+  botId?: string,
+): boolean {
+  if (!botId) {
+    return false;
+  }
+  return Boolean(message.mentionedUsers?.some((user) => user?.id === botId));
+}
+
+function hasInlineBotMention(content: string, botId?: string): boolean {
+  if (!botId || content.length === 0) {
+    return false;
+  }
+  const escapedBotId = botId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const mentionPattern = new RegExp(`<@!?${escapedBotId}>`);
+  return mentionPattern.test(content);
+}
+
+async function hydrateDiscordInboundMessage(params: {
+  message: DiscordMessagePreflightParams["data"]["message"];
+  isGuildMessage: boolean;
+  botId?: string;
+}): Promise<DiscordMessagePreflightParams["data"]["message"]> {
+  const { message, isGuildMessage, botId } = params;
+  const fetchFn = (
+    message as {
+      fetch?: (() => Promise<DiscordMessagePreflightParams["data"]["message"]>) | null;
+    }
+  ).fetch;
+  if (typeof fetchFn !== "function" || !isGuildMessage) {
+    return message;
+  }
+
+  const attachmentCount = countDiscordAttachments(message);
+  const content =
+    typeof (message as { content?: unknown }).content === "string"
+      ? (message as { content: string }).content
+      : "";
+  const isPartial = Boolean((message as { partial?: boolean }).partial);
+  const hasMention =
+    hasExplicitBotMention(message, botId) || hasInlineBotMention(content, botId);
+  const shouldHydrate =
+    isPartial || (attachmentCount === 0 && (hasMention || content.trim().length === 0));
+  if (!shouldHydrate) {
+    return message;
+  }
+
+  try {
+    const fetched = await fetchFn.call(message);
+    const fetchedAttachmentCount = countDiscordAttachments(fetched);
+    if (shouldLogVerbose() && fetchedAttachmentCount > attachmentCount) {
+      logVerbose(
+        `discord: hydrated inbound message ${message.id} attachments ${attachmentCount}->${fetchedAttachmentCount}`,
+      );
+    }
+    return fetched;
+  } catch (err) {
+    logVerbose(`discord: failed to hydrate message ${message.id}: ${String(err)}`);
+    return message;
+  }
+}
+
 export async function preflightDiscordMessage(
   params: DiscordMessagePreflightParams,
 ): Promise<DiscordMessagePreflightContext | null> {
   const logger = getChildLogger({ module: "discord-auto-reply" });
-  const message = params.data.message;
+  let message = params.data.message;
   const author = params.data.author;
   if (!author) {
     return null;
@@ -113,6 +184,12 @@ export async function preflightDiscordMessage(
     logVerbose("discord: drop dm (dms disabled)");
     return null;
   }
+  const botId = params.botUserId;
+  message = await hydrateDiscordInboundMessage({
+    message,
+    isGuildMessage,
+    botId,
+  });
 
   const dmPolicy = params.discordConfig?.dm?.policy ?? "pairing";
   let commandAuthorized = true;
@@ -181,7 +258,6 @@ export async function preflightDiscordMessage(
     }
   }
 
-  const botId = params.botUserId;
   const baseText = resolveDiscordMessageText(message, {
     includeForwarded: false,
   });

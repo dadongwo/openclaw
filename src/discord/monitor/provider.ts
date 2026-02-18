@@ -1,7 +1,12 @@
 import { Client, type BaseMessageInteractiveComponent } from "@buape/carbon";
 import { GatewayIntents, GatewayPlugin } from "@buape/carbon/gateway";
 import { Routes } from "discord-api-types/v10";
+import { existsSync, readdirSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { inspect } from "node:util";
+import WebSocket, { type ClientOptions as WebSocketClientOptions } from "ws";
 import type { HistoryEntry } from "../../auto-reply/reply/history.js";
 import type { OpenClawConfig, ReplyToMode } from "../../config/config.js";
 import type { RuntimeEnv } from "../../runtime.js";
@@ -22,7 +27,7 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveDiscordAccount } from "../accounts.js";
 import { attachDiscordGatewayLogging } from "../gateway-logging.js";
 import { getDiscordGatewayEmitter, waitForDiscordGatewayStop } from "../monitor.gateway.js";
-import { fetchDiscordApplicationId } from "../probe.js";
+import { fetchDiscordApplicationId, fetchDiscordApplicationSummary } from "../probe.js";
 import { resolveDiscordChannelAllowlist } from "../resolve-channels.js";
 import { resolveDiscordUserAllowlist } from "../resolve-users.js";
 import { normalizeDiscordToken } from "../token.js";
@@ -52,6 +57,147 @@ export type MonitorDiscordOpts = {
   historyLimit?: number;
   replyToMode?: ReplyToMode;
 };
+
+type ProxyAgentCtor = new (proxyUrl: string) => NonNullable<WebSocketClientOptions["agent"]>;
+
+let discordProxyAgentCtorCache: ProxyAgentCtor | null | undefined;
+
+function resolveDiscordGatewayProxyUrl(): string | undefined {
+  const candidates = [
+    process.env.HTTPS_PROXY,
+    process.env.https_proxy,
+    process.env.ALL_PROXY,
+    process.env.all_proxy,
+    process.env.HTTP_PROXY,
+    process.env.http_proxy,
+  ];
+  for (const value of candidates) {
+    const normalized = typeof value === "string" ? value.trim() : "";
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return undefined;
+}
+
+function summarizeProxyUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}`;
+  } catch {
+    return "configured";
+  }
+}
+
+function normalizeProxyAgentCtor(mod: unknown): ProxyAgentCtor | null {
+  if (!mod || typeof mod !== "object") {
+    return null;
+  }
+  const candidate = (mod as Record<string, unknown>).ProxyAgent;
+  if (typeof candidate === "function") {
+    return candidate as ProxyAgentCtor;
+  }
+  const fallback = (mod as Record<string, unknown>).default;
+  if (typeof fallback === "function") {
+    return fallback as ProxyAgentCtor;
+  }
+  return null;
+}
+
+function loadProxyAgentCtorFromPnpmStore(): ProxyAgentCtor | null {
+  const requireForCurrentModule = createRequire(import.meta.url);
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  let currentDir = moduleDir;
+  for (let depth = 0; depth < 10; depth += 1) {
+    const storeDir = join(currentDir, "node_modules", ".pnpm");
+    if (existsSync(storeDir)) {
+      const proxyAgentEntry = readdirSync(storeDir).find((entry) =>
+        entry.startsWith("proxy-agent@"),
+      );
+      if (proxyAgentEntry) {
+        const proxyAgentPath = join(storeDir, proxyAgentEntry, "node_modules", "proxy-agent");
+        if (existsSync(proxyAgentPath)) {
+          try {
+            const loaded = requireForCurrentModule(proxyAgentPath);
+            return normalizeProxyAgentCtor(loaded);
+          } catch {
+            return null;
+          }
+        }
+      }
+    }
+    const parent = dirname(currentDir);
+    if (parent === currentDir) {
+      break;
+    }
+    currentDir = parent;
+  }
+  return null;
+}
+
+function loadDiscordProxyAgentCtor(): ProxyAgentCtor | null {
+  if (discordProxyAgentCtorCache !== undefined) {
+    return discordProxyAgentCtorCache;
+  }
+  const requireForCurrentModule = createRequire(import.meta.url);
+  try {
+    const loaded = requireForCurrentModule("proxy-agent");
+    const ctor = normalizeProxyAgentCtor(loaded);
+    if (ctor) {
+      discordProxyAgentCtorCache = ctor;
+      return ctor;
+    }
+  } catch {
+    // Fallback below.
+  }
+  const ctorFromStore = loadProxyAgentCtorFromPnpmStore();
+  discordProxyAgentCtorCache = ctorFromStore;
+  return ctorFromStore;
+}
+
+function resolveDiscordGatewayWebSocketOptions(
+  runtime: RuntimeEnv,
+): WebSocketClientOptions | undefined {
+  const proxyUrl = resolveDiscordGatewayProxyUrl();
+  if (!proxyUrl) {
+    return undefined;
+  }
+  const proxyAgentCtor = loadDiscordProxyAgentCtor();
+  if (!proxyAgentCtor) {
+    runtime.log?.(
+      warn(
+        `discord: proxy is configured (${summarizeProxyUrl(proxyUrl)}), but proxy-agent is unavailable; gateway websocket may bypass proxy`,
+      ),
+    );
+    return undefined;
+  }
+  try {
+    const agent = new proxyAgentCtor(proxyUrl);
+    runtime.log?.(`discord: gateway websocket proxy enabled (${summarizeProxyUrl(proxyUrl)})`);
+    return { agent };
+  } catch (err) {
+    runtime.error?.(
+      danger(`discord: failed to create websocket proxy agent: ${formatErrorMessage(err)}`),
+    );
+    return undefined;
+  }
+}
+
+class OpenClawDiscordGatewayPlugin extends GatewayPlugin {
+  constructor(
+    options: ConstructorParameters<typeof GatewayPlugin>[0],
+    private readonly wsOptions?: WebSocketClientOptions,
+  ) {
+    super(options);
+  }
+
+  protected override createWebSocket(url: string): WebSocket {
+    if (this.wsOptions) {
+      return new WebSocket(url, this.wsOptions);
+    }
+    return super.createWebSocket(url);
+  }
+}
 
 function summarizeAllowList(list?: Array<string | number>) {
   if (!list || list.length === 0) {
@@ -124,14 +270,21 @@ function formatDiscordDeployErrorDetails(err: unknown): string {
 
 function resolveDiscordGatewayIntents(
   intentsConfig?: import("../../config/types.discord.js").DiscordIntentsConfig,
+  opts?: { messageContentStatus?: "enabled" | "limited" | "disabled" },
 ): number {
   let intents =
     GatewayIntents.Guilds |
     GatewayIntents.GuildMessages |
-    GatewayIntents.MessageContent |
     GatewayIntents.DirectMessages |
     GatewayIntents.GuildMessageReactions |
     GatewayIntents.DirectMessageReactions;
+  const messageContentEnabledByPortal =
+    opts?.messageContentStatus === "enabled" || opts?.messageContentStatus === "limited";
+  const shouldEnableMessageContent =
+    intentsConfig?.messageContent ?? messageContentEnabledByPortal;
+  if (shouldEnableMessageContent) {
+    intents |= GatewayIntents.MessageContent;
+  }
   if (intentsConfig?.presence) {
     intents |= GatewayIntents.GuildPresences;
   }
@@ -424,9 +577,16 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     );
   }
 
-  const applicationId = await fetchDiscordApplicationId(token, 4000);
+  const applicationSummary = await fetchDiscordApplicationSummary(token, 4000);
+  const applicationId = applicationSummary?.id ?? (await fetchDiscordApplicationId(token, 4000));
   if (!applicationId) {
     throw new Error("Failed to resolve Discord application id");
+  }
+  const messageContentStatus = applicationSummary?.intents?.messageContent;
+  if (messageContentStatus === "disabled") {
+    runtime.log?.(
+      warn("discord: Message Content Intent disabled in Portal; running in mention-safe mode."),
+    );
   }
 
   const maxDiscordCommands = 100;
@@ -512,6 +672,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     );
   }
 
+  const gatewayWebSocketOptions = resolveDiscordGatewayWebSocketOptions(runtime);
   const client = new Client(
     {
       baseUrl: "http://localhost",
@@ -527,13 +688,18 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       components,
     },
     [
-      new GatewayPlugin({
+      new OpenClawDiscordGatewayPlugin(
+        {
         reconnect: {
           maxAttempts: 50,
         },
-        intents: resolveDiscordGatewayIntents(discordCfg.intents),
+        intents: resolveDiscordGatewayIntents(discordCfg.intents, {
+          messageContentStatus,
+        }),
         autoInteractions: true,
-      }),
+        },
+        gatewayWebSocketOptions,
+      ),
     ],
   );
 

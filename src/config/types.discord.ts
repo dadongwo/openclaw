@@ -85,6 +85,8 @@ export type DiscordActionConfig = {
 };
 
 export type DiscordIntentsConfig = {
+  /** Enable Message Content privileged intent (requires Portal opt-in). Default: auto (enabled only when Portal allows). */
+  messageContent?: boolean;
   /** Enable Guild Presences privileged intent (requires Portal opt-in). Default: false. */
   presence?: boolean;
   /** Enable Guild Members privileged intent (requires Portal opt-in). Default: false. */

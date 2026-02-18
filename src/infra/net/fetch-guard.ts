@@ -70,6 +70,26 @@ function buildAbortSignal(params: { timeoutMs?: number; signal?: AbortSignal }):
   return { signal: controller.signal, cleanup };
 }
 
+function hasProxyConfigured(protocol: string): boolean {
+  const candidates =
+    protocol === "https:"
+      ? [
+          process.env.HTTPS_PROXY,
+          process.env.https_proxy,
+          process.env.ALL_PROXY,
+          process.env.all_proxy,
+          process.env.HTTP_PROXY,
+          process.env.http_proxy,
+        ]
+      : [
+          process.env.HTTP_PROXY,
+          process.env.http_proxy,
+          process.env.ALL_PROXY,
+          process.env.all_proxy,
+        ];
+  return candidates.some((value) => typeof value === "string" && value.trim().length > 0);
+}
+
 export async function fetchWithSsrFGuard(params: GuardedFetchOptions): Promise<GuardedFetchResult> {
   const fetcher: FetchLike | undefined = params.fetchImpl ?? globalThis.fetch;
   if (!fetcher) {
@@ -119,7 +139,8 @@ export async function fetchWithSsrFGuard(params: GuardedFetchOptions): Promise<G
         lookupFn: params.lookupFn,
         policy: params.policy,
       });
-      if (params.pinDns !== false) {
+      const shouldPinDns = params.pinDns !== false && !hasProxyConfigured(parsedUrl.protocol);
+      if (shouldPinDns) {
         dispatcher = createPinnedDispatcher(pinned);
       }
 
